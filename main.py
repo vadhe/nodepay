@@ -1,7 +1,6 @@
 import asyncio
 import aiohttp
 import time
-import requests
 import uuid
 from loguru import logger
 from colorama import Fore, Style, init
@@ -49,37 +48,28 @@ def valid_resp(resp):
         raise ValueError("Invalid response")
     return resp
 
-proxy_auth_status = {}
-
-async def render_profile_info(proxy, token):
+async def render_profile_info(token):
     global browser_id, account_info
 
     try:
-        np_session_info = load_session_info(proxy)
+        browser_id = uuidv4()
+        response = await call_api(DOMAIN_API["SESSION"], {}, token)
+        if response is None:
+            return
         
-        if not proxy_auth_status.get(proxy):
-            browser_id = uuidv4()
-            response = await call_api(DOMAIN_API["SESSION"], {}, proxy, token)
-            if response is None:
-                return
-            valid_resp(response)
-            account_info = response["data"]
-            
-            if account_info.get("uid"):
-                proxy_auth_status[proxy] = True
-                save_session_info(proxy, account_info)
-                logger.info(f"Authentication successful for proxy {proxy} account: {account_info}")
-            else:
-                handle_logout(proxy)
-                return
+        valid_resp(response)
+        account_info = response["data"]
         
-        if proxy_auth_status[proxy]:
-            await start_ping(proxy, token)
+        if account_info.get("uid"):
+            logger.info(f"Authentication successful for account: {account_info}")
+            await start_ping(token)
+        else:
+            handle_logout()
 
     except Exception as e:
-        logger.error(f"Error in render_profile_info for proxy {proxy}: {e}")
+        logger.error(f"Error in render_profile_info: {e}")
 
-async def call_api(url, data, proxy, token, max_retries=3):
+async def call_api(url, data, token, max_retries=3):
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -92,7 +82,7 @@ async def call_api(url, data, proxy, token, max_retries=3):
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True)) as session:
         for attempt in range(max_retries):
             try:
-                async with session.post(url, json=data, headers=headers, proxy=proxy, timeout=10) as response:
+                async with session.post(url, json=data, headers=headers, timeout=10) as response:
                     response.raise_for_status()
                     resp_json = await response.json()
                     return valid_resp(resp_json)
@@ -107,24 +97,24 @@ async def call_api(url, data, proxy, token, max_retries=3):
 
     return None
 
-async def start_ping(proxy, token):
+async def start_ping(token):
     try:
         while True:
-            await ping(proxy, token)
+            await ping(token)
             await asyncio.sleep(PING_INTERVAL)
     except asyncio.CancelledError:
-        logger.info(f"{Fore.YELLOW}Ping task for proxy {proxy} was cancelled")
+        logger.info(f"{Fore.YELLOW}Ping task was cancelled")
     except Exception as e:
-        logger.error(f"{Fore.RED}Error in start_ping for proxy {proxy}: {e}")
+        logger.error(f"{Fore.RED}Error in start_ping: {e}")
 
-async def ping(proxy, token):
+async def ping(token):
     global last_ping_time, RETRIES, status_connect
 
     current_time = time.time()
-    if proxy in last_ping_time and (current_time - last_ping_time[proxy]) < PING_INTERVAL:
+    if last_ping_time and (current_time - last_ping_time.get('last', 0)) < PING_INTERVAL:
         return
 
-    last_ping_time[proxy] = current_time
+    last_ping_time['last'] = current_time
     ping_urls = DOMAIN_API["PING"]
 
     for url in ping_urls:
@@ -135,61 +125,38 @@ async def ping(proxy, token):
                 "timestamp": int(time.time()),
                 "version": '2.2.7'
             }
-            logger.warning(f"Starting ping task for proxy {proxy} Data: {data}")
-            response = await call_api(url, data, proxy, token)
+            logger.warning(f"Starting ping task. Data: {data}")
+            response = await call_api(url, data, token)
             if response["code"] == 0:
-                logger.info(f"{Fore.CYAN}Ping successful via proxy {proxy} - {response}")
+                logger.info(f"{Fore.CYAN}Ping successful - {response}")
                 RETRIES = 0
                 status_connect = CONNECTION_STATES["CONNECTED"]
                 return 
             else:
-                logger.error(f"{Fore.RED}Ping failed via proxy {proxy} - {response}")
-                handle_ping_fail(proxy, response)
+                logger.error(f"{Fore.RED}Ping failed - {response}")
+                handle_ping_fail(response)
         except Exception as e:
-            logger.error(f"{Fore.RED}Ping error via proxy {proxy}: {e}")
+            logger.error(f"{Fore.RED}Ping error: {e}")
 
-    handle_ping_fail(proxy, None)  
+    handle_ping_fail(None)  
 
-def handle_ping_fail(proxy, response):
+def handle_ping_fail(response):
     global RETRIES, status_connect
 
     RETRIES += 1
     if response and response.get("code") == 403:
-        handle_logout(proxy)
+        handle_logout()
     elif RETRIES < 2:
         status_connect = CONNECTION_STATES["DISCONNECTED"]
     else:
         status_connect = CONNECTION_STATES["DISCONNECTED"]
 
-def handle_logout(proxy):
+def handle_logout():
     global status_connect, account_info
 
     status_connect = CONNECTION_STATES["NONE_CONNECTION"]
     account_info = {}
-    save_status(proxy, None)
-    logger.info(f"{Fore.YELLOW}Logged out and cleared session info for proxy {proxy}")
-
-def load_proxies(proxy_file):
-    try:
-        with open(proxy_file, 'r') as file:
-            proxies = file.read().splitlines()
-        return proxies
-    except Exception as e:
-        logger.error(f"Failed to load proxies: {e}")
-        raise SystemExit("Exiting due to failure in loading proxies")
-
-def save_status(proxy, status):
-    pass
-
-def save_session_info(proxy, data):
-    data_to_save = {
-        "uid": data.get("uid"),
-        "browser_id": browser_id
-    }
-    pass
-
-def load_session_info(proxy):
-    return {}
+    logger.info(f"{Fore.YELLOW}Logged out and cleared session info")
 
 def load_tokens_from_file(filename):
     try:
@@ -207,24 +174,12 @@ async def main():
     tokens = load_tokens_from_file(TOKEN_FILE)
 
     while True:
-        r = requests.get("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt", stream=True)
-        if r.status_code == 200:
-            with open('proxies.txt', 'wb') as f:
-                for chunk in r:
-                    f.write(chunk)
-            with open('proxies.txt', 'r') as file:
-                all_proxies = file.read().splitlines()
-                
         for token in tokens:
-            tasks = {asyncio.create_task(render_profile_info(proxy, token)): proxy for proxy in all_proxies}
+            tasks = {asyncio.create_task(render_profile_info(token)): True for token in tokens}
 
             done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 tasks.pop(task)
-
-            for proxy in set(all_proxies) - set(tasks.values()):
-                new_task = asyncio.create_task(render_profile_info(proxy, token))
-                tasks[new_task] = proxy
 
             await asyncio.sleep(3)
         await asyncio.sleep(10)
